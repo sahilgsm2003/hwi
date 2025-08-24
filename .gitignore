@@ -1,1 +1,10 @@
 pune_ndvi_data/
+temp_scene_images/
+output/
+visual_scene_report
+__pycache__/
+data/
+visual_scene_report_for_28.7041_77.1025.pdf
+pune_vegetation_change.png
+pune_ndvi_max_2025-04-01_to_2025-06-30.tiff   
+pune_ndvi_mean_2025-04-01_to_2025-06-30.tiff

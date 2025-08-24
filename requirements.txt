@@ -1,0 +1,9 @@
+rasterio
+numpy
+Flask
+Pillow
+matplotlib
+openai
+shapely
+fpdf2
+matplotlib
