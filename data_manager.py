@@ -1,13 +1,19 @@
 import os
 import rasterio
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import requests
+from geopy.geocoders import Nominatim
+from collections import defaultdict
+from datetime import timedelta
 
 # --- 1. CONFIGURATION ---
 CLIENT_ID = "sh-61654116-66e8-45f4-a553-50ad0a07929a"
 CLIENT_SECRET = "Tusibl8GSpjCDDWJOgO85GINHTv93GAG"
 BASE_DATA_DIR = "data"
+
+# This is no longer a fixed window, but will be determined dynamically.
+# SEASONAL_WINDOW = ("06-01", "08-31") 
 
 NDVI_EVALSCRIPT = """
 //VERSION=3
@@ -31,14 +37,10 @@ function evaluatePixel(sample) {
 }
 """
 
-# --- 2. AUTHENTICATION ---
+# --- 2. AUTHENTICATION & GECODING ---
 def get_access_token():
     auth_url = 'https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token'
-    auth_data = {
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
-        'grant_type': 'client_credentials'
-    }
+    auth_data = {'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET, 'grant_type': 'client_credentials'}
     try:
         response = requests.post(auth_url, data=auth_data)
         response.raise_for_status()
@@ -47,103 +49,170 @@ def get_access_token():
         print(f"Error during authentication: {e}")
         return None
 
-# --- 3. DATA DOWNLOADING ---
-def get_best_images_for_bbox(token, bbox, download_dir):
+def get_coords_from_place_name(place_name):
+    """Converts a place name to latitude and longitude."""
+    try:
+        geolocator = Nominatim(user_agent="vegetation_analyzer")
+        location = geolocator.geocode(place_name)
+        if location:
+            return True, (location.latitude, location.longitude)
+        else:
+            return False, "Location not found."
+    except Exception as e:
+        return False, str(e)
+
+# --- 3. DATA DOWNLOADING & PROCESSING ---
+def find_optimal_seasonal_window(token, bbox):
     """
-    Finds and downloads the 2 best (lowest cloud cover) images for each of the past 5 years.
+    Analyzes 5 years of metadata to find the 3-month window with the
+    lowest average cloud cover.
     """
-    all_features = []
+    print("--- Analyzing historical data to find clearest season ---")
+    monthly_cloud_cover = defaultdict(list)
     today = datetime.now()
 
+    # 1. Fetch metadata for the last 5 years
     for i in range(5):
         end_date = today - timedelta(days=i * 365)
         start_date = end_date - timedelta(days=365)
-        
-        start_date_str = start_date.strftime("%Y-%m-%d")
-        end_date_str = end_date.strftime("%Y-%m-%d")
-        
-        print(f"\nSearching for images between {start_date_str} and {end_date_str}...")
-        
         search_url = "https://sh.dataspace.copernicus.eu/api/v1/catalog/1.0.0/search"
         headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-        
-        # Search payload without server-side sorting. We will sort locally.
         search_payload = {
-            "bbox": bbox,
-            "datetime": f"{start_date_str}T00:00:00Z/{end_date_str}T23:59:59Z",
-            "collections": ["sentinel-2-l2a"],
-            "limit": 50 # Fetch up to 50 scenes to ensure we get some good ones
+            "bbox": bbox, "datetime": f"{start_date.strftime('%Y-%m-%d')}T00:00:00Z/{end_date.strftime('%Y-%m-%d')}T23:59:59Z",
+            "collections": ["sentinel-2-l2a"], "limit": 100
         }
-        
         try:
-            response = requests.post(search_url, headers=headers, json=search_payload)
+            response = requests.post(search_url, headers=headers, json=search_payload, timeout=60)
             response.raise_for_status()
             features = response.json().get('features', [])
-            
-            # --- Sort the results locally by cloud cover ---
-            features.sort(key=lambda f: f['properties'].get('eo:cloud_cover', 101)) # Sort by cloud cover, default to 101 if not present
-            
-            # Take the top 2 features for the year
-            top_features = features[:2]
-            print(f"Found {len(features)} scenes, selecting top {len(top_features)} for the year by cloud cover.")
-            all_features.extend(top_features)
-        except requests.exceptions.RequestException as e:
-            print(f"Could not search for year {i+1}: {e}")
-            continue
+            for f in features:
+                month = datetime.strptime(f['properties']['datetime'][:10], '%Y-%m-%d').month
+                cloud_cover = f['properties'].get('eo:cloud_cover', 100)
+                monthly_cloud_cover[month].append(cloud_cover)
+        except requests.exceptions.RequestException:
+            continue # If one year fails, just continue
 
-    if not all_features:
-        return False
+    # 2. Calculate average cloud cover for each month
+    avg_monthly_cc = {}
+    for month, values in monthly_cloud_cover.items():
+        avg_monthly_cc[month] = np.mean(values) if values else 100
 
-    print(f"\nFound a total of {len(all_features)} candidate images over 5 years. Downloading them...")
-    for feature in all_features:
-        date = feature['properties']['datetime'][:10]
-        cloud_cover = feature['properties']['eo:cloud_cover']
-        filename = f"ndvi_{date}_cc{cloud_cover}.tiff" # Include cloud cover in filename
-        filepath = os.path.join(download_dir, filename)
-        if not os.path.exists(filepath):
-            download_single_image(token, bbox, date, filepath)
-            
-    return True
+    if len(avg_monthly_cc) < 3:
+        print("  ! Not enough historical data. Defaulting to Oct-Dec window.")
+        return (10, 12)
 
-def download_single_image(token, bbox, date, filepath):
-    process_url = "https://sh.dataspace.copernicus.eu/api/v1/process"
-    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json', 'Accept': 'image/tiff'}
-    payload = {
-        "input": {
-            "bounds": {"bbox": bbox, "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}},
-            "data": [{"type": "sentinel-2-l2a", "dataFilter": {"timeRange": {"from": f"{date}T00:00:00Z", "to": f"{date}T23:59:59Z"}}}]
-        },
-        "output": {"width": 512, "height": 512, "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}]},
-        "evalscript": NDVI_EVALSCRIPT
+    # 3. Find the 3-month window with the lowest sum of averages
+    min_cc = float('inf')
+    best_start_month = -1
+    # Check all possible 3-month windows, including wrapping around the year
+    for i in range(1, 13):
+        month1 = i
+        month2 = (i % 12) + 1
+        month3 = ((i + 1) % 12) + 1
+        
+        cc1 = avg_monthly_cc.get(month1, 100)
+        cc2 = avg_monthly_cc.get(month2, 100)
+        cc3 = avg_monthly_cc.get(month3, 100)
+        current_cc = cc1 + cc2 + cc3
+
+        if current_cc < min_cc:
+            min_cc = current_cc
+            best_start_month = month1
+    
+    # Convert start month to a (start_month, end_month) tuple
+    start_month = best_start_month
+    end_month = ((best_start_month + 1) % 12) + 1
+    
+    print(f"  ✓ Optimal window found: Month {start_month} to {end_month}")
+    return (start_month, end_month)
+
+def download_and_composite_for_year(token, bbox, year, seasonal_window, location_data_dir):
+    """
+    Finds the best 10 images for a given year's optimal seasonal window,
+    downloads them, and creates a single max composite TIFF.
+    """
+    start_month, end_month = seasonal_window
+    
+    # Handle year wrapping for the date range
+    if start_month <= end_month:
+        start_date = datetime(year, start_month, 1)
+        end_date = datetime(year, end_month, 1) + timedelta(days=31) # Go to start of next month
+        end_date = min(datetime(year, end_month, 31), end_date - timedelta(days=end_date.day)) # get last day of month
+    else: # Window wraps around new year, e.g., Nov-Jan
+        start_date = datetime(year - 1, start_month, 1)
+        end_date = datetime(year, end_month, 31)
+
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = end_date.strftime("%Y-%m-%d")
+    
+    print(f"\n--- Processing Year {year} (Optimal Window: {start_date_str} to {end_date_str}) ---")
+
+    # 1. Search for available scenes
+    search_url = "https://sh.dataspace.copernicus.eu/api/v1/catalog/1.0.0/search"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    search_payload = {
+        "bbox": bbox, "datetime": f"{start_date_str}T00:00:00Z/{end_date_str}T23:59:59Z",
+        "collections": ["sentinel-2-l2a"], "limit": 50
     }
     
     try:
-        print(f"Downloading NDVI data for {date}...")
-        response = requests.post(process_url, headers=headers, json=payload)
+        response = requests.post(search_url, headers=headers, json=search_payload)
         response.raise_for_status()
-        with open(filepath, 'wb') as f:
-            f.write(response.content)
-        print(f"✓ Successfully downloaded: {os.path.basename(filepath)}")
+        features = response.json().get('features', [])
     except requests.exceptions.RequestException as e:
-        print(f"✗ Error downloading NDVI for {date}: {e}")
+        print(f"  ✗ Could not search for scenes in {year}: {e}")
+        return None # Skip this year
+
+    if not features:
+        print(f"  ✗ No scenes found for {year}.")
+        return None
+
+    # 2. Sort locally and select the best ones
+    features.sort(key=lambda f: f['properties'].get('eo:cloud_cover', 101))
+    best_features = features[:15] # Increase to 15 for better coverage
+    print(f"  ✓ Found {len(features)} scenes, selecting top {len(best_features)} to create composite.")
+
+    # 3. Download the selected images
+    image_paths_for_composite = []
+    for feature in best_features:
+        date = feature['properties']['datetime'][:10]
+        cloud_cover = feature['properties'].get('eo:cloud_cover', -1)
+        filename = f"{year}_{date}_cc{cloud_cover:.2f}.tiff"
+        filepath = os.path.join(location_data_dir, filename)
+        
+        if not os.path.exists(filepath):
+            print(f"    Downloading {filename}...")
+            download_single_image(token, bbox, date, filepath, NDVI_EVALSCRIPT)
+        
+        if os.path.exists(filepath):
+             image_paths_for_composite.append(filepath)
+
+    if not image_paths_for_composite:
+        print(f"  ✗ Failed to download any images for {year}.")
+        return None
+
+    # 4. Create and save the composite image
+    output_filename = f"composite_max_{year}_{bbox[1]}_{bbox[0]}.tiff"
+    output_path = os.path.join("output", output_filename)
+    create_composite_image(image_paths_for_composite, output_path, method='max')
+    
+    return output_path
 
 
-# --- 4. DATA PROCESSING (from analysis.py) ---
-def read_tiff(file_path):
-    with rasterio.open(file_path) as src:
-        data = src.read(1).astype('float32')
-        nodata = src.nodata
-        if nodata is not None:
-            data[data == nodata] = np.nan
-        return data, src.profile
-
-def find_all_images(data_dir):
-    """Finds all TIFF files in a directory."""
-    image_paths = []
-    for file in os.listdir(data_dir):
-        if file.endswith(".tiff"):
-            image_paths.append(os.path.join(data_dir, file))
-    return sorted(image_paths)
+def download_single_image(token, bbox, date, filepath, evalscript):
+    process_url = "https://sh.dataspace.copernicus.eu/api/v1/process"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json', 'Accept': 'image/tiff'}
+    payload = {
+        "input": { "bounds": {"bbox": bbox, "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}}, "data": [{"type": "sentinel-2-l2a", "dataFilter": {"timeRange": {"from": f"{date}T00:00:00Z", "to": f"{date}T23:59:59Z"}}}]},
+        "output": {"width": 512, "height": 512, "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}]},
+        "evalscript": evalscript
+    }
+    try:
+        response = requests.post(process_url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        with open(filepath, 'wb') as f: f.write(response.content)
+    except requests.exceptions.RequestException as e:
+        print(f"    ✗ Download error for {date}: {e}")
 
 def create_composite_image(image_paths, output_path, method='max'):
     if not image_paths:
@@ -161,39 +230,45 @@ def create_composite_image(image_paths, output_path, method='max'):
     profile.update(dtype=rasterio.float32, count=1, nodata=np.nan)
     with rasterio.open(output_path, 'w', **profile) as dst:
         dst.write(composite_data.astype(rasterio.float32), 1)
-    print(f"Composite image saved to: {output_path}")
+    print(f"  ✓ Composite image saved to: {output_path}")
 
-# --- 5. MAIN CONTROLLER ---
-def process_request(bbox, output_path):
+def read_tiff(file_path):
+    with rasterio.open(file_path) as src:
+        data = src.read(1).astype('float32')
+        nodata = src.nodata
+        if nodata is not None:
+            data[data == nodata] = np.nan
+        return data, src.profile
+        
+# --- 4. MAIN CONTROLLER ---
+def generate_yearly_composites(bbox, start_year, end_year):
     """
-    Main controller function. It ensures the best 10 images from the last 5 years
-    are available locally and then creates a single max composite from them.
+    Main controller. Determines optimal season then generates yearly composites.
     """
     try:
         bbox_str = "_".join(map(str, bbox))
         location_data_dir = os.path.join(BASE_DATA_DIR, bbox_str)
         os.makedirs(location_data_dir, exist_ok=True)
-
-        # We always check for new, better images from the server.
-        print("Authenticating to check for the latest and best images...")
+        
         token = get_access_token()
         if not token:
             return False, "Failed to authenticate with Copernicus."
-        
-        # This function will find the best 10 images and download them if not present.
-        get_best_images_for_bbox(token, bbox, location_data_dir)
 
-        # Get all images available locally for that location (should be our 10 best)
-        image_files = find_all_images(location_data_dir)
+        # Find the best seasonal window first
+        optimal_window = find_optimal_seasonal_window(token, bbox)
 
-        if not image_files:
-             return False, "Sufficient data could not be found or downloaded."
+        results = {"composites": {}, "skipped_years": [], "optimal_window_months": optimal_window}
+        for year in range(start_year, end_year + 1):
+            composite_path = download_and_composite_for_year(
+                token, bbox, year, optimal_window, location_data_dir
+            )
+            if composite_path:
+                results["composites"][year] = composite_path
+            else:
+                results["skipped_years"].append(year)
         
-        print(f"\nCreating a max composite from {len(image_files)} available images.")
-        create_composite_image(image_files, output_path, method='max')
-        
-        return True, output_path
+        return True, results
 
     except Exception as e:
-        print(f"An error occurred in process_request: {e}")
+        print(f"An unexpected error occurred in generate_yearly_composites: {e}")
         return False, str(e)
